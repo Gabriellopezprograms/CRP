@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Compartir y Ver Pantalla (auto, sin SDP)</title>
+<style>
+  :root{--bg:#0d1117;--fg:#f0f6fc;--mut:#94a3b8;--ok:#238636;--accent:#1f6feb;--card:#111827}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
+  header{padding:18px;text-align:center}
+  h1{margin:0 0 6px;font-size:clamp(18px,4vw,28px)}
+  main{max-width:960px;margin:0 auto 40px;padding:0 14px;display:grid;gap:12px}
+  .card{background:var(--card);border:1px solid #1f2937;border-radius:14px;padding:14px}
+  .stack{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  label{font-weight:600}
+  input[type=text]{background:#0a1220;color:var(--fg);border:1px solid #243244;border-radius:10px;padding:8px 10px}
+  button{background:var(--ok);color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+  button.secondary{background:var(--accent)}
+  button[disabled]{opacity:.6;cursor:not-allowed}
+  small{color:var(--mut)}
+  video{width:100%;background:#000;border-radius:12px;border:1px solid #1f2937}
+</style>
+</head>
+<body>
+<header>
+  <h1>Compartir y Ver Pantalla</h1>
+  <small>WebRTC P2P con señalización WebSocket. Sin copiar/pegar SDP. Audio incluido (si el navegador lo permite).</small>
+</header>
+<main>
+  <div class="card">
+    <div class="stack">
+      <button id="modeShare" class="secondary">📱 Compartir (teléfono)</button>
+      <button id="modeWatch" class="secondary">🖥 Ver (PC)</button>
+      <label for="room">Sala:</label>
+      <input id="room" type="text" value="1234" maxlength="32"/>
+      <small>Abre la misma URL en ambos dispositivos y usa el mismo <b>código de sala</b>.</small>
+    </div>
+  </div>
+
+  <!-- Panel Compartir -->
+  <section id="sharePanel" class="card">
+    <h3>📱 Compartir pantalla</h3>
+    <div class="stack">
+      <label><input type="checkbox" id="chkAudio" checked> Compartir audio</label>
+      <label><input type="checkbox" id="chk60" checked> 60 FPS</label>
+    </div>
+    <div class="stack" style="margin-top:8px">
+      <button id="btnStart">Elegir pantalla</button>
+      <button id="btnStop" disabled>Detener</button>
+      <span id="statusShare"><small>Estado: listo</small></span>
+    </div>
+    <video id="localVideo" playsinline muted></video>
+  </section>
+
+  <!-- Panel Ver -->
+  <section id="watchPanel" class="card" style="display:none">
+    <h3>🖥 Ver pantalla</h3>
+    <div class="stack">
+      <button id="btnConnect">Conectar</button>
+      <button id="btnFullscreen" class="secondary">Pantalla completa</button>
+      <span id="statusWatch"><small>Estado: listo</small></span>
+    </div>
+    <video id="remoteVideo" playsinline autoplay controls></video>
+    <small>Tip: Usa la misma Wi‑Fi para menor latencia.</small>
+  </section>
+
+  <div class="card">
+    <b>Cómo usar:</b>
+    <ol>
+      <li>Abre esta misma página en el <b>teléfono</b> y en la <b>PC</b>.</li>
+      <li>En ambos, escribe el mismo <b>código de sala</b>.</li>
+      <li>En el teléfono: pulsa <b>Elegir pantalla</b>.</li>
+      <li>En la PC: pulsa <b>Conectar</b> y luego <b>Pantalla completa</b> si quieres.</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+// ===== CONFIGURA AQUÍ LA URL DEL SERVIDOR WEBSOCKET =====
+// Cambia el puerto si usas otro. Ejemplo: ws://TU_IP_LOCAL:3000
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':3000';
+
+// ===== UI =====
+const modeShare = document.getElementById('modeShare');
+const modeWatch = document.getElementById('modeWatch');
+const sharePanel = document.getElementById('sharePanel');
+const watchPanel = document.getElementById('watchPanel');
+const roomInput = document.getElementById('room');
+
+const chkAudio = document.getElementById('chkAudio');
+const chk60 = document.getElementById('chk60');
+const btnStart = document.getElementById('btnStart');
+const btnStop = document.getElementById('btnStop');
+const statusShare = document.getElementById('statusShare');
+const localVideo = document.getElementById('localVideo');
+
+const btnConnect = document.getElementById('btnConnect');
+const btnFullscreen = document.getElementById('btnFullscreen');
+const statusWatch = document.getElementById('statusWatch');
+const remoteVideo = document.getElementById('remoteVideo');
+
+modeShare.onclick = () => { sharePanel.style.display='block'; watchPanel.style.display='none'; };
+modeWatch.onclick = () => { sharePanel.style.display='none'; watchPanel.style.display='block'; };
+
+// ===== WebRTC base =====
+const rtcConfig = { iceServers: [
+  { urls: [ 'stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302' ] }
+] };
+let pc;              // RTCPeerConnection
+let ws;              // WebSocket
+let localStream;     // MediaStream
+let isSender = false;
+
+function logShare(msg){ statusShare.innerHTML = `<small>${msg}</small>`; }
+function logWatch(msg){ statusWatch.innerHTML = `<small>${msg}</small>`; }
+
+function connectWS(role, room){
+  return new Promise((resolve, reject) => {
+    try{
+      ws = new WebSocket(WS_URL);
+      ws.onopen = () => { ws.send(JSON.stringify({ type:'join', room, role })); resolve(); };
+      ws.onerror = (e) => { reject(new Error('WS error')); };
+    }catch(e){ reject(e); }
+  });
+}
+
+function sendWS(payload){ ws && ws.readyState===1 && ws.send(JSON.stringify(payload)); }
+
+function cleanup(){
+  try{ localStream?.getTracks().forEach(t=>t.stop()); }catch{}
+  try{ pc?.close(); }catch{}
+  pc = null; localStream = null;
+}
+
+// ===== Sender =====
+btnStart.onclick = async () => {
+  try {
+    isSender = true;
+    const room = roomInput.value.trim()||'1234';
+
+    const fps = chk60.checked ? {ideal:60,max:60} : {ideal:30};
+    localStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: fps, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: !!chkAudio.checked
+    });
+
+    // Hint para movimiento
+    const vt = localStream.getVideoTracks()[0];
+    if (vt && vt.contentHint !== undefined) vt.contentHint = 'motion';
+
+    localVideo.srcObject = localStream; localVideo.muted = true; await localVideo.play().catch(()=>{});
+    btnStop.disabled = false; logShare('Pantalla capturada. Conectando…');
+
+    await connectWS('sender', room);
+
+    pc = new RTCPeerConnection(rtcConfig);
+    localStream.getTracks().forEach(t=> pc.addTrack(t, localStream));
+
+    pc.onicecandidate = (ev) => {
+      if(ev.candidate) sendWS({ type:'candidate', room, role:'sender', candidate: ev.candidate });
+    };
+    pc.onconnectionstatechange = () => logShare('Conexión: ' + pc.connectionState);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendWS({ type:'offer', room, sdp: pc.localDescription });
+
+    ws.onmessage = async ({data}) => {
+      const msg = JSON.parse(data);
+      if(msg.type === 'answer' && msg.room === room){
+        await pc.setRemoteDescription(msg.sdp);
+      } else if(msg.type === 'candidate' && msg.role==='viewer' && msg.room===room){
+        try{ await pc.addIceCandidate(msg.candidate); }catch{}
+      }
+    };
+  } catch (e) {
+    alert('No se pudo compartir: ' + e.message);
+    cleanup();
+  }
+};
+
+btnStop.onclick = () => { cleanup(); logShare('Detenido'); btnStop.disabled = true; };
+
+// ===== Viewer =====
+btnConnect.onclick = async () => {
+  try {
+    isSender = false;
+    const room = roomInput.value.trim()||'1234';
+    await connectWS('viewer', room);
+
+    pc = new RTCPeerConnection(rtcConfig);
+    pc.ontrack = (ev) => { remoteVideo.srcObject = ev.streams[0]; };
+    pc.onicecandidate = (ev) => { if(ev.candidate) sendWS({ type:'candidate', room, role:'viewer', candidate: ev.candidate }); };
+    pc.onconnectionstatechange = () => logWatch('Conexión: ' + pc.connectionState);
+
+    ws.onmessage = async ({data}) => {
+      const msg = JSON.parse(data);
+      if(msg.type === 'offer' && msg.room === room){
+        await pc.setRemoteDescription(msg.sdp);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendWS({ type:'answer', room, sdp: pc.localDescription });
+      } else if(msg.type === 'candidate' && msg.role==='sender' && msg.room===room){
+        try{ await pc.addIceCandidate(msg.candidate); }catch{}
+      }
+    };
+
+    logWatch('Esperando oferta…');
+  } catch (e) {
+    alert('No se pudo conectar: ' + e.message);
+    cleanup();
+  }
+};
+
+btnFullscreen.onclick = () => {
+  const el = remoteVideo;
+  if (el.requestFullscreen) el.requestFullscreen();
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+};
+</script>
+
+<!--
+=============================
+Servidor de señalización (Node.js)
+=============================
+1) Crea un archivo llamado server.js con el contenido de abajo.
+2) Instala dependencias:  npm init -y && npm i ws
+3) Ejecuta:              node server.js
+4) Abre la página HTML en ambos dispositivos. Si está en otra máquina, cambia WS_URL arriba a ws://IP-DE-TU-PC:3000
+
+// server.js
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ port: 3000 });
+const rooms = new Map(); // roomId -> Set(sockets)
+
+function broadcast(room, sender, data){
+  const peers = rooms.get(room) || new Set();
+  for(const ws of peers){
+    if(ws!==sender && ws.readyState===1){ ws.send(JSON.stringify(data)); }
+  }
+}
+
+wss.on('connection', ws => {
+  let roomId = null;
+  ws.on('message', raw => {
+    try{
+      const msg = JSON.parse(raw);
+      if(msg.type==='join'){
+        roomId = String(msg.room||'1234');
+        if(!rooms.has(roomId)) rooms.set(roomId, new Set());
+        rooms.get(roomId).add(ws);
+        ws.send(JSON.stringify({type:'joined', room:roomId}));
+      } else if(['offer','answer','candidate'].includes(msg.type)){
+        if(roomId) broadcast(roomId, ws, msg);
+      }
+    }catch{}
+  });
+  ws.on('close', ()=>{ if(roomId && rooms.has(roomId)){ rooms.get(roomId).delete(ws); if(rooms.get(roomId).size===0) rooms.delete(roomId); } });
+});
+console.log('Signaling WS running on ws://localhost:3000');
+-->
+
+</body>
+</html>
